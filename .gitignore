@@ -1,0 +1,9 @@
+# 虚拟环境
+.venv/
+
+# Python 产物
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
