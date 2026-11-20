@@ -24,6 +24,7 @@ class CommandRecord:
     ok: bool            # 退出码 == 0
     output: str = ""    # stdout；失败时 stderr 也并进来
     time: str = ""      # 执行时刻
+    show_output: bool = False   # 日志面板是否回显输出（内嵌命令行用 True）
 
     def __post_init__(self) -> None:
         if not self.time:
@@ -130,6 +131,21 @@ class GitRepo:
             path = rest.split(" -> ")[-1] if " -> " in rest else rest
             info.files.append(GitFile(path=path, x=x, y=y))
         return info
+
+
+    # ---- 能力 2：勾选即提交（v1 #2：暂存只在幕后，命令栏照实显示） ----
+    def stage(self, paths: list[str]) -> CommandRecord:
+        """勾上 = 进入下次提交（幕后即 git add）"""
+        return self.run_git(["add", "--", *paths])
+
+    def unstage(self, paths: list[str]) -> CommandRecord:
+        """取消勾选 = 从下次提交里拿出来（幕后即 git restore --staged）"""
+        return self.run_git(["restore", "--staged", "--", *paths])
+
+    # ---- 能力 3：提交 ----
+    def commit(self, message: str) -> CommandRecord:
+        """提交已勾选的改动（幕后即 git commit -m）"""
+        return self.run_git(["commit", "-m", message])
 
 
 def _parse_branch_line(text: str) -> BranchInfo:

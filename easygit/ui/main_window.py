@@ -11,13 +11,15 @@ import subprocess
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from .. import features
 from ..core import settings as settings_mod
-from ..core.executor import CommandLog
-from ..core.git_wrapper import GitRepo, StatusInfo
+from ..core.executor import CommandLog, translate_error
+from ..core.git_wrapper import CommandRecord, GitRepo, StatusInfo
+from ..core.shell import run_shell
 from .worker import run_async
 
 
@@ -32,6 +34,9 @@ class MainWindow(QMainWindow):
         self._workers: list = []        # 活跃后台线程引用（防垃圾回收）
         self.repo: GitRepo | None = None
         self.pages: dict[str, QWidget] = {}
+        self._staged_count = 0          # 已勾选、将提交的文件数（驱动提交按钮）
+        self._shown_log = 0             # 已写入日志面板的条数
+        self._term_cwd = None            # 内嵌终端会话目录（cd 持久，切仓库时重置）
 
         self._build_ui()
         self._reload_repos()
@@ -55,7 +60,7 @@ class MainWindow(QMainWindow):
         self.label_ab.setStyleSheet("color:#1565c0;")
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(self.refresh_status)
-        btn_terminal = QPushButton("打开终端")
+        btn_terminal = QPushButton("外部终端")
         btn_terminal.clicked.connect(self.open_terminal)
         hbar.addWidget(self.label_branch)
         hbar.addWidget(self.label_ab)
@@ -125,32 +130,67 @@ class MainWindow(QMainWindow):
         self.edit_msg = QLineEdit()
         self.edit_msg.setPlaceholderText("提交消息（一行写完）…")
         self.btn_commit = QPushButton("提交")
-        self.btn_commit.setEnabled(False)   # 勾选即提交在下一里程碑接入
-        self.btn_commit.setToolTip("勾选即提交将在下一里程碑接入")
+        self.btn_commit.setEnabled(False)   # 有勾选且有消息时激活
+        self.btn_commit.clicked.connect(self._commit)
+        self.edit_msg.textChanged.connect(self._update_commit_button)
+        self.edit_msg.returnPressed.connect(self._commit)   # ≤3 秒流程：消息写完回车即提交
         hc.addWidget(self.edit_msg, 1)
         hc.addWidget(self.btn_commit)
+
+        # ---- 命令与日志栏：可展开如终端（第六章 5 升级，2026-11-20 标定） ----
+        log_pane = QWidget()
+        log_pane.setObjectName("logpane")
+        log_pane.setStyleSheet("QWidget#logpane{background:#1e1e1e;}")
+        log_pane.setAttribute(Qt.WA_StyledBackground, True)
+        lvp = QVBoxLayout(log_pane)
+        lvp.setContentsMargins(6, 2, 6, 4)
+        lvp.setSpacing(2)
+
+        head_row = QHBoxLayout()
+        self.btn_log_toggle = QPushButton("▸ 命令与日志")
+        self.btn_log_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_log_toggle.setStyleSheet(
+            "QPushButton{color:#9cdcfe;font-weight:bold;border:none;background:transparent;}")
+        self.btn_log_toggle.clicked.connect(self._toggle_log)
+        self.label_cmd_text = QLabel("")
+        # 关键修复：Ignored 策略——长命令文本不再把窗口最小宽度撑爆
+        self.label_cmd_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.label_cmd_text.setStyleSheet("color:#ccc;")
+        head_row.addWidget(self.btn_log_toggle)
+        head_row.addWidget(self.label_cmd_text, 1)
+        lvp.addLayout(head_row)
+
+        self.edit_log = QPlainTextEdit()
+        self.edit_log.setReadOnly(True)
+        self.edit_log.setStyleSheet(
+            "QPlainTextEdit{background:#1a1a1a;color:#d4d4d4;"
+            "font-family:Consolas,'Courier New',monospace;font-size:9pt;border:1px solid #333;}")
+        self.edit_log.hide()
+        lvp.addWidget(self.edit_log, 1)
+
+        # 内嵌命令行：提示符 + 输入框（展开日志面板时可用）
+        in_row = QHBoxLayout()
+        prompt = QLabel("❯")
+        prompt.setStyleSheet("color:#4ec9b0;font-weight:bold;font-family:Consolas,monospace;")
+        self.edit_term = QLineEdit()
+        self.edit_term.setPlaceholderText("输入命令，回车执行（ls/cat/grep 可用；clear 清屏；cd 切换目录）")
+        self.edit_term.setStyleSheet(
+            "QLineEdit{background:#1a1a1a;color:#d4d4d4;"
+            "font-family:Consolas,monospace;border:1px solid #333;padding:2px 6px;}")
+        self.edit_term.returnPressed.connect(self._run_typed_command)
+        self.edit_term.hide()
+        in_row.addWidget(prompt)
+        in_row.addWidget(self.edit_term, 1)
+        lvp.addLayout(in_row)
 
         vsplit = QSplitter(Qt.Vertical)
         vsplit.addWidget(split)
         vsplit.addWidget(commit_bar)
+        vsplit.addWidget(log_pane)
         vsplit.setStretchFactor(0, 1)
-        vsplit.setSizes([600, 70])
+        vsplit.setSizes([560, 60, 34])
+        self._vsplit = vsplit   # 展开日志面板时同步调整分割配额
         root.addWidget(vsplit, 1)
-
-        # ---- 命令预览与日志栏（第六章 5） ----
-        cmd_bar = QWidget()
-        cmd_bar.setObjectName("cmdbar")
-        cmd_bar.setStyleSheet("QWidget#cmdbar{background:#1e1e1e;}")
-        cmd_bar.setAttribute(Qt.WA_StyledBackground, True)
-        hcmd = QHBoxLayout(cmd_bar)
-        hcmd.setContentsMargins(8, 3, 8, 3)
-        head_cmd = QLabel("▾ 命令预览与日志")
-        head_cmd.setStyleSheet("color:#9cdcfe;font-weight:bold;")
-        self.label_cmd_text = QLabel("")
-        self.label_cmd_text.setStyleSheet("color:#ccc;")
-        hcmd.addWidget(head_cmd)
-        hcmd.addWidget(self.label_cmd_text, 1)
-        root.addWidget(cmd_bar)
 
         self.setCentralWidget(central)
 
@@ -174,6 +214,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.repo = GitRepo(path, self.log)
+        self._term_cwd = path             # 切仓库时重置终端会话目录
         self.setWindowTitle(f"EasyGit —— {path}")
         self.refresh_status()
 
@@ -198,6 +239,36 @@ class MainWindow(QMainWindow):
             subprocess.Popen(
                 ["powershell", "-NoExit", "-Command",
                  f"Set-Location -LiteralPath '{self.repo.path}'"])
+
+    # ================================================ 功能页统一入口（统一执行管道）
+    def run_git_job(self, fn, on_done=None) -> None:
+        """后台执行一个 git 操作；完成后：报错大白话提示 → 自动刷新状态。
+        fn(repo) -> CommandRecord；on_done(result) 总会先执行（result 可能是异常）。"""
+        if not self.repo:
+            return
+        repo = self.repo
+
+        def job():
+            return fn(repo)
+
+        def done(result):
+            if on_done:
+                on_done(result)              # 功能页自己的收尾（如解除 busy）总是执行
+            if self.repo is not repo:          # 用户已切走仓库，丢弃过期结果
+                return
+            if isinstance(result, Exception):
+                self.label_cmd_text.setStyleSheet("color:#f48771;")
+                self.label_cmd_text.setText(f"操作失败：{result}")
+                return
+            if isinstance(result, CommandRecord) and not result.ok:
+                first = result.output.splitlines()[0] if result.output else "执行失败"
+                self.label_cmd_text.setStyleSheet("color:#f48771;")
+                self.label_cmd_text.setText(
+                    f"✗ {result.cmd} —— {translate_error(result.output) or first}")
+                return
+            self.refresh_status()
+
+        run_async(job, done, parent=self, keep=self._workers)
 
     # ================================================ 状态刷新（异步，界面永不冻结）
     def refresh_status(self) -> None:
@@ -233,11 +304,129 @@ class MainWindow(QMainWindow):
             self.banner.show()
         else:
             self.banner.hide()
-        # 改动页 + 命令栏
+        # 改动页 + 提交按钮 + 命令栏
+        self._staged_count = sum(1 for f in status.files if f.group == "staged")
+        self._update_commit_button()
         page = self.pages.get("改动")
         if page:
             page.refresh_from(status)
-        self.label_cmd_text.setText(self.log.tail_text(3))
+        self.label_cmd_text.setStyleSheet("color:#ccc;")
+        self._sync_log_pane()
+
+    # ================================================ 命令与日志面板（终端式）
+    def _toggle_log(self) -> None:
+        if self.edit_log.isHidden():
+            self.edit_log.show()
+            self.edit_term.show()
+            self.edit_term.setFocus()
+            self.btn_log_toggle.setText("▾ 命令与日志")
+            self._vsplit.setSizes([500, 60, 220])   # 展开时给日志区让出高度
+        else:
+            self.edit_log.hide()
+            self.edit_term.hide()
+            self.btn_log_toggle.setText("▸ 命令与日志")
+            self._vsplit.setSizes([560, 60, 34])    # 收起时还回去
+
+    def _sync_log_pane(self) -> None:
+        """把 CommandLog 里尚未显示的记录写入日志面板；摘要行只显示最近一条"""
+        recs = list(self.log.records)
+        for rec in recs[self._shown_log:]:
+            mark = "OK  " if rec.ok else "FAIL"
+            self.edit_log.appendPlainText(f"[{rec.time}] {mark} {rec.cmd}")
+            if rec.output and (rec.show_output or not rec.ok):
+                lines = rec.output.splitlines()[:200]   # 超长输出截断保护
+                for line in lines:
+                    self.edit_log.appendPlainText("      " + line)
+        self._shown_log = len(recs)
+        self.label_cmd_text.setText(recs[-1].cmd if recs else "")
+
+    def _run_typed_command(self) -> None:
+        """内嵌命令行：执行用户输入的命令（clear 清屏、cd 持久，贴近真终端手感）"""
+        text = self.edit_term.text().strip()
+        if not text or not self.repo:
+            return
+        cwd = self._term_cwd or self.repo.path
+
+        # 屏幕类命令拦截：日志面板是文本框不是屏幕，clear 的转义码在这里没有意义
+        if text in ("clear", "cls"):
+            self.edit_term.clear()
+            self.edit_log.clear()
+            return
+        if text == "cd" or text.startswith("cd "):
+            self._cd_session(cwd, text[3:].strip() if len(text) > 2 else None)
+            self.edit_term.clear()
+            return
+
+        self.edit_term.clear()
+        self.edit_term.setEnabled(False)   # 执行期间锁定输入
+
+        def job():
+            return run_shell(cwd, text)
+
+        def done(result):
+            self.edit_term.setEnabled(True)
+            self.edit_term.setFocus()
+            if isinstance(result, Exception):
+                self.log.add(CommandRecord(cmd=f"$ {text}", ok=False,
+                                           output=str(result)))
+            else:
+                self.log.add(result)
+            self._sync_log_pane()
+            # 手敲的 git 命令也可能改了仓库状态 → 顺手刷新
+            if text.split()[0] == "git":
+                self.refresh_status()
+
+        run_async(job, done, parent=self, keep=self._workers)
+
+    def _cd_session(self, cwd: str, target: str | None) -> None:
+        """内嵌终端的 cd：切换会话工作目录；不带参数 = 回仓库根目录"""
+        if target is None:
+            self._term_cwd = self.repo.path
+            self.edit_log.appendPlainText(f"$ cd  →  {self._term_cwd}")
+            return
+        argv_path = target.replace("\\", "/")   # bash 只认正斜杠
+        self.edit_term.setEnabled(False)
+
+        def job():
+            # pwd -W 是 Git Bash 扩展：输出 Windows 形式路径
+            return run_shell(cwd, f"cd {argv_path} && pwd -W")
+
+        def done(result):
+            self.edit_term.setEnabled(True)
+            self.edit_term.setFocus()
+            if isinstance(result, Exception):
+                self.log.add(CommandRecord(cmd=f"$ cd {target}", ok=False,
+                                           output=str(result)))
+                self._sync_log_pane()
+                return
+            if not result.ok:
+                self.log.add(result)
+                self._sync_log_pane()
+                return
+            new_cwd = result.output.strip().splitlines()[-1]
+            self._term_cwd = new_cwd
+            self.edit_log.appendPlainText(f"$ cd {target}  →  {new_cwd}")
+
+        run_async(job, done, parent=self, keep=self._workers)
+
+    # ================================================ 提交（≤3 秒流程）
+    def _update_commit_button(self) -> None:
+        has_msg = bool(self.edit_msg.text().strip())
+        n = self._staged_count
+        self.btn_commit.setEnabled(n > 0 and has_msg)
+        self.btn_commit.setText(f"提交（{n} 个文件）" if n else "提交")
+
+    def _commit(self) -> None:
+        msg = self.edit_msg.text().strip()
+        if not msg or not self.repo:
+            return
+        self.btn_commit.setEnabled(False)
+
+        def on_done(rec):
+            if isinstance(rec, CommandRecord) and rec.ok:
+                self.edit_msg.clear()   # 提交成功后清空消息；状态由自动刷新更新
+
+        self.run_git_job(lambda repo: repo.commit(msg), on_done)
 
     def _set_branch_text(self, branch) -> None:
         if branch is None or (not branch.name and not branch.detached):

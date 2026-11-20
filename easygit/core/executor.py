@@ -25,3 +25,24 @@ class CommandLog:
             mark = "✓" if rec.ok else "✗"
             items.append(f"{mark} {rec.time} {rec.cmd}")
         return "  ·  ".join(items)
+
+
+# 常见 git 报错 → 大白话（需求文档 第八章「报错翻译」，随用随扩充）
+ERROR_HINTS = [
+    (
+        "Please tell me who you are",
+        "git 还不知道你是谁。点工具栏「打开终端」，运行："
+        'git config --global user.name "你的名字" 、'
+        'git config --global user.email "你的邮箱"，然后重试。',
+    ),
+    ("non-fast-forward", "远端有你没有的新提交，先拉取再推送。"),
+    ("nothing to commit", "没有勾选任何改动，先在改动页勾文件。"),
+]
+
+
+def translate_error(output: str) -> str | None:
+    """把 git 报错翻译成大白话；没见过的报错返回 None（界面显示原文第一行）"""
+    for key, hint in ERROR_HINTS:
+        if key in output:
+            return hint
+    return None
