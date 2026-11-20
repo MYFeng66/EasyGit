@@ -214,7 +214,8 @@ class MainWindow(QMainWindow):
 
         # ---- 工具栏：永远可见的状态 ----
         bar = QWidget()
-        bar.setStyleSheet("background:#f0f0f0;border-bottom:1px solid #cccccc;")
+        bar.setObjectName("toolbar")
+        bar.setStyleSheet("QWidget#toolbar{background:#f0f0f0;border-bottom:1px solid #cccccc;}")
         bar.setAttribute(Qt.WA_StyledBackground, True)
         h = QHBoxLayout(bar)
         h.setContentsMargins(8, 4, 8, 4)
@@ -230,7 +231,8 @@ class MainWindow(QMainWindow):
 
         # ---- 提示条（仅异常时出现，此处展示形态） ----
         banner = QWidget()
-        banner.setStyleSheet("background:#fff3cd;border-bottom:1px solid #e0c060;")
+        banner.setObjectName("banner")
+        banner.setStyleSheet("QWidget#banner{background:#fff3cd;border-bottom:1px solid #e0c060;}")
         banner.setAttribute(Qt.WA_StyledBackground, True)
         bh = QHBoxLayout(banner)
         bh.setContentsMargins(8, 4, 8, 4)
@@ -280,7 +282,8 @@ class MainWindow(QMainWindow):
 
         # ---- 命令预览与日志栏 ----
         cmd_bar = QWidget()
-        cmd_bar.setStyleSheet("background:#1e1e1e;")
+        cmd_bar.setObjectName("cmdbar")
+        cmd_bar.setStyleSheet("QWidget#cmdbar{background:#1e1e1e;}")
         cmd_bar.setAttribute(Qt.WA_StyledBackground, True)
         cc = QHBoxLayout(cmd_bar)
         cc.setContentsMargins(8, 3, 8, 3)

@@ -45,7 +45,8 @@ class MainWindow(QMainWindow):
 
         # ---- 工具栏：一切状态可见 ----
         bar = QWidget()
-        bar.setStyleSheet("background:#f0f0f0;border-bottom:1px solid #ccc;")
+        bar.setObjectName("toolbar")   # 命名选择器：样式只作用于容器本身，不向子控件扩散
+        bar.setStyleSheet("QWidget#toolbar{background:#f0f0f0;border-bottom:1px solid #ccc;}")
         bar.setAttribute(Qt.WA_StyledBackground, True)   # 不加此属性背景色不会绘制
         hbar = QHBoxLayout(bar)
         hbar.setContentsMargins(8, 4, 8, 4)
@@ -65,8 +66,8 @@ class MainWindow(QMainWindow):
 
         # ---- 提示条（仅异常时出现，第六章 4） ----
         self.banner = QWidget()
-        self.banner.setStyleSheet(
-            "background:#fff3cd;border-bottom:1px solid #e0c060;")
+        self.banner.setObjectName("banner")
+        self.banner.setStyleSheet("QWidget#banner{background:#fff3cd;border-bottom:1px solid #e0c060;}")
         self.banner.setAttribute(Qt.WA_StyledBackground, True)
         hb = QHBoxLayout(self.banner)
         hb.setContentsMargins(8, 4, 8, 4)
@@ -138,7 +139,8 @@ class MainWindow(QMainWindow):
 
         # ---- 命令预览与日志栏（第六章 5） ----
         cmd_bar = QWidget()
-        cmd_bar.setStyleSheet("background:#1e1e1e;")
+        cmd_bar.setObjectName("cmdbar")
+        cmd_bar.setStyleSheet("QWidget#cmdbar{background:#1e1e1e;}")
         cmd_bar.setAttribute(Qt.WA_StyledBackground, True)
         hcmd = QHBoxLayout(cmd_bar)
         hcmd.setContentsMargins(8, 3, 8, 3)

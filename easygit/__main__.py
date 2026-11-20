@@ -8,7 +8,7 @@ import sys
 
 
 def main() -> None:
-    from PySide6.QtCore import QTimer
+    from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QFont
     from PySide6.QtWidgets import QApplication
 
@@ -16,6 +16,12 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 10))
+    # Windows 深色模式下，Qt 6.8+ 会自动切深色调色板（文字变白），
+    # 与本工具的浅色主题（工具栏 #f0f0f0 等）冲突 → 强制浅色方案
+    try:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    except (AttributeError, TypeError):
+        pass  # 老版本 PySide6 无此 API，保持默认
     win = MainWindow()
     win.show()
 
