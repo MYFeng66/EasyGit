@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
@@ -32,9 +35,14 @@ _BRANCH_BTN_STYLE = (
 
 
 class MainWindow(QMainWindow):
+    # 应用图标（随包分发，PyInstaller 友好）
+    ICON = Path(__file__).resolve().parents[1] / "assets" / "easygit.ico"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EasyGit —— 你自己的 Git 管理器")
+        if self.ICON.exists():
+            self.setWindowIcon(QIcon(str(self.ICON)))
         self.resize(1080, 720)
 
         self.settings = settings_mod.load()
@@ -68,8 +76,7 @@ class MainWindow(QMainWindow):
 
         # ---- 工具栏：一切状态可见 ----
         bar = QWidget()
-        bar.setObjectName("toolbar")   # 命名选择器：样式只作用于容器本身，不向子控件扩散
-        bar.setStyleSheet("QWidget#toolbar{background:#f0f0f0;border-bottom:1px solid #ccc;}")
+        bar.setObjectName("toolbar")   # 主题 QSS 由 theme.py 全局负责
         bar.setAttribute(Qt.WA_StyledBackground, True)   # 不加此属性背景色不会绘制
         hbar = QHBoxLayout(bar)
         hbar.setContentsMargins(8, 4, 8, 4)
@@ -78,16 +85,22 @@ class MainWindow(QMainWindow):
         self.label_branch.setFlat(True)
         self.label_branch.setCursor(Qt.PointingHandCursor)
         self.label_branch.setStyleSheet(_BRANCH_BTN_STYLE)
+        self.label_branch.setToolTip("点击弹出分支列表，单击切换（支持搜索）")
         self.label_branch.clicked.connect(self._open_branch_popup)
         self.label_ab = QLabel("")
         self.label_ab.setStyleSheet("color:#1565c0;")
+        self.label_ab.setToolTip("领先远端 ↑ 的提交数 / 落后 ↓ 的提交数")
         btn_pull = QPushButton("拉取")
+        btn_pull.setToolTip("fetch 之后合并：把远端新提交拿进来，融入当前分支")
         btn_pull.clicked.connect(self._pull)
         btn_push = QPushButton("推送")
+        btn_push.setToolTip("把当前分支的新提交送到远端；首次推送自动建立关联")
         btn_push.clicked.connect(self._push)
         btn_refresh = QPushButton("刷新")
+        btn_refresh.setToolTip("重新读取仓库状态（不动任何文件）")
         btn_refresh.clicked.connect(self.refresh_status)
         btn_terminal = QPushButton("终端")
+        btn_terminal.setToolTip("展开内嵌命令行（Git Bash），不弹外部窗口")
         btn_terminal.clicked.connect(self._open_embedded_terminal)
         hbar.addWidget(self.label_branch)
         hbar.addWidget(self.label_ab)
@@ -152,6 +165,8 @@ class MainWindow(QMainWindow):
         self.edit_msg = QLineEdit()
         self.edit_msg.setPlaceholderText("提交消息（一行写完）…")
         self.btn_commit = QPushButton("提交")
+        self.btn_commit.setProperty("accent", True)   # git 橙主操作款（theme.py）
+        self.btn_commit.setToolTip("把勾选的文件写入一条新提交；回车同效")
         self.btn_commit.setEnabled(False)   # 有勾选且有消息时激活
         self.btn_commit.clicked.connect(self._commit)
         self.edit_msg.textChanged.connect(self._update_commit_button)
@@ -159,6 +174,7 @@ class MainWindow(QMainWindow):
         hc.addWidget(self.edit_msg, 1)
         hc.addWidget(self.btn_commit)
         self.btn_undo = QPushButton("撤销 ▾")
+        self.btn_undo.setToolTip("撤销上次提交（未推送）或反提交抵消（已推送）")
         undo_menu = QMenu(self)
         act_undo = undo_menu.addAction("撤销上次提交（改动保留，未推送时用）")
         act_revert = undo_menu.addAction("反提交抵消上次提交（已推送时用）")
@@ -321,6 +337,15 @@ class MainWindow(QMainWindow):
             if isinstance(result, Exception):
                 self.label_cmd_text.setStyleSheet("color:#f48771;")
                 self.label_cmd_text.setText(f"操作失败：{result}")
+                # 总改造一期：异常绝不沉默（今天两只 TypeError 的教训）。
+                # 失败的 CommandRecord 已有大白话翻译，只沉命令栏；
+                # 异常属意外情况（代码/环境问题），必须当面告知。
+                QMessageBox.critical(
+                    self, "操作失败",
+                    "刚才的操作没有执行成功：\n\n"
+                    f"{result}\n\n"
+                    "详细信息在底部「命令与日志」栏。\n"
+                    "如果反复出现，重启 EasyGit 后再试。")
                 return
             if isinstance(result, CommandRecord) and not result.ok:
                 first = result.output.splitlines()[0] if result.output else "执行失败"

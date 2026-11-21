@@ -7,8 +7,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QFont, QPen
 from PySide6.QtWidgets import (
-    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMenu, QMessageBox, QPushButton, QSplitter, QStyle,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMenu, QMessageBox, QPushButton, QSplitter, QStyle,
     QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
@@ -136,12 +136,19 @@ class HistoryPage(QWidget):
         bar.setContentsMargins(8, 4, 8, 4)
         self.label_count = QLabel("切换仓库后这里显示提交历史")
         self.label_count.setStyleSheet("color:#666;")
+        # 搜索过滤（总改造一期：大仓库找提交的刚需）
+        self.edit_search = QLineEdit()
+        self.edit_search.setPlaceholderText("搜索提交（消息 / 作者 / 哈希）")
+        self.edit_search.setClearButtonEnabled(True)
+        self.edit_search.setFixedWidth(260)
+        self.edit_search.textChanged.connect(self._apply_filter)
         btn_more = QPushButton("加载更多")
         btn_more.clicked.connect(lambda: self._load(more=True))
         btn_reload = QPushButton("刷新")
         btn_reload.clicked.connect(self.reload_from_ctx)
         bar.addWidget(self.label_count)
         bar.addStretch(1)
+        bar.addWidget(self.edit_search)
         bar.addWidget(btn_more)
         bar.addWidget(btn_reload)
         v.addLayout(bar)
@@ -177,6 +184,27 @@ class HistoryPage(QWidget):
         split.addWidget(right)
         split.setSizes([660, 420])
         v.addWidget(split, 1)
+
+    # ================================================ 搜索过滤（总改造一期）
+    def _apply_filter(self, text: str) -> None:
+        """客户端过滤已加载的提交：关键词命中消息/作者/哈希（不区分大小写）"""
+        kw = text.strip().lower()
+        hit_n = 0
+        for i in range(self.list.count()):
+            c = self.list.item(i).data(COMMIT_ROLE)
+            hit = not kw or (c and (kw in c.subject.lower()
+                                    or kw in c.author.lower()
+                                    or kw in c.hash.lower()
+                                    or kw in c.short.lower()))
+            self.list.setRowHidden(i, not hit)
+            if hit:
+                hit_n += 1
+        if kw:
+            self.label_count.setText(
+                f"匹配 {hit_n} / 已加载 {self.list.count()} 条（可点「加载更多」扩大范围）")
+        else:
+            self.label_count.setText(
+                f"已加载 {self.list.count()} 条提交")
 
     # ================================================ 对外接口
     def reload_from_ctx(self) -> None:
@@ -241,6 +269,8 @@ class HistoryPage(QWidget):
                 self.list.addItem(item)
             self._skip = len(self._commits)
             self.label_count.setText(f"已加载 {len(self._commits)} 条提交")
+            # 重建列表后重新套用当前搜索词
+            self._apply_filter(self.edit_search.text())
 
         self.ctx.run_job(job, done)
 

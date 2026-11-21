@@ -13,9 +13,11 @@ def main() -> None:
     from PySide6.QtWidgets import QApplication
 
     from .ui.main_window import MainWindow
+    from .ui.theme import apply_theme
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 10))
+    apply_theme(app)   # 现代扁平化全局主题（总改造一期）
     # Windows 深色模式下，Qt 6.8+ 会自动切深色调色板（文字变白），
     # 与本工具的浅色主题（工具栏 #f0f0f0 等）冲突 → 强制浅色方案
     try:
