@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import subprocess
-
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
@@ -21,8 +19,16 @@ from ..core.executor import CommandLog, translate_error
 from ..core.git_wrapper import CommandRecord, GitRepo, StatusInfo
 from ..core.shell import run_shell
 from .add_repo_dialog import AddRepoDialog
+from .branch_popup import BranchPopup
 from .conflict_dialog import ConflictDialog
 from .worker import run_async
+
+
+# 工具栏分支名按钮的基础样式（含悬停反馈）
+_BRANCH_BTN_STYLE = (
+    "QPushButton{text-align:left;border:none;padding:2px 6px;}"
+    "QPushButton:hover{background:#e2e2e2;border-radius:3px;}"
+)
 
 
 class MainWindow(QMainWindow):
@@ -42,6 +48,7 @@ class MainWindow(QMainWindow):
         self._last_status: StatusInfo | None = None    # 最近状态（守卫/推拉判断用）
         self._repo_has_remote = False    # 当前仓库有没有远端
         self._banner_action = None       # 提示条按钮当前动作
+        self._detach_return_branch = None   # detached 查看前的原分支（一键回家）
 
         self._build_ui()
         self._reload_repos()
@@ -66,7 +73,12 @@ class MainWindow(QMainWindow):
         bar.setAttribute(Qt.WA_StyledBackground, True)   # 不加此属性背景色不会绘制
         hbar = QHBoxLayout(bar)
         hbar.setContentsMargins(8, 4, 8, 4)
-        self.label_branch = QLabel("分支：—")
+        # 分支名本身可点（IDEA 式，用户标定 2026-11-21）：点击弹出分支弹窗
+        self.label_branch = QPushButton("分支：— ▾")
+        self.label_branch.setFlat(True)
+        self.label_branch.setCursor(Qt.PointingHandCursor)
+        self.label_branch.setStyleSheet(_BRANCH_BTN_STYLE)
+        self.label_branch.clicked.connect(self._open_branch_popup)
         self.label_ab = QLabel("")
         self.label_ab.setStyleSheet("color:#1565c0;")
         btn_pull = QPushButton("拉取")
@@ -75,8 +87,8 @@ class MainWindow(QMainWindow):
         btn_push.clicked.connect(self._push)
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(self.refresh_status)
-        btn_terminal = QPushButton("外部终端")
-        btn_terminal.clicked.connect(self.open_terminal)
+        btn_terminal = QPushButton("终端")
+        btn_terminal.clicked.connect(self._open_embedded_terminal)
         hbar.addWidget(self.label_branch)
         hbar.addWidget(self.label_ab)
         hbar.addWidget(btn_pull)
@@ -115,6 +127,8 @@ class MainWindow(QMainWindow):
         head.setStyleSheet("font-weight:bold;padding:4px;")
         self.list_repo = QListWidget()
         self.list_repo.currentTextChanged.connect(self._select_repo)
+        self.list_repo.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_repo.customContextMenuRequested.connect(self._repo_menu)
         btn_add = QPushButton("+ 添加仓库")
         btn_add.clicked.connect(self.add_repo)
         lv.addWidget(head)
@@ -171,6 +185,8 @@ class MainWindow(QMainWindow):
         self.label_cmd_text = QLabel("")
         # 关键修复：Ignored 策略——长命令文本不再把窗口最小宽度撑爆
         self.label_cmd_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        # 摘要行可选中复制（用户标定 2026-11-21）
+        self.label_cmd_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.label_cmd_text.setStyleSheet("color:#ccc;")
         head_row.addWidget(self.btn_log_toggle)
         head_row.addWidget(self.label_cmd_text, 1)
@@ -254,16 +270,37 @@ class MainWindow(QMainWindow):
             settings_mod.save(self.settings)
         self._reload_repos()
 
-    def open_terminal(self) -> None:
-        """v1 #8：在当前仓库打开外部终端——GUI 覆盖不到的角落，命令行是逃生通道"""
-        if not self.repo:
+    def _repo_menu(self, pos) -> None:
+        """左栏仓库右键菜单（v1 #7 补全：取消托管）"""
+        item = self.list_repo.itemAt(pos)
+        if not item:
             return
-        try:
-            subprocess.Popen(["wt", "-d", self.repo.path])
-        except FileNotFoundError:
-            subprocess.Popen(
-                ["powershell", "-NoExit", "-Command",
-                 f"Set-Location -LiteralPath '{self.repo.path}'"])
+        path = item.text()
+        menu = QMenu(self)
+        act = menu.addAction("取消托管（仅从列表移除，不删除磁盘仓库）")
+        act.triggered.connect(lambda: self._remove_repo(path))
+        menu.exec(self.list_repo.viewport().mapToGlobal(pos))
+
+    def _remove_repo(self, path: str) -> None:
+        """取消托管：从列表移除，磁盘上的仓库文件不受任何影响"""
+        btn = QMessageBox.question(
+            self, "取消托管",
+            f"EasyGit 不再管理这个仓库：\n{path}\n\n"
+            "仅从左侧列表移除；磁盘上的仓库文件不受任何影响。\n\n继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if btn != QMessageBox.Yes:
+            return
+        repos = self.settings.setdefault("repos", [])
+        if path in repos:
+            repos.remove(path)
+            settings_mod.save(self.settings)
+        self._reload_repos()
+
+    def _open_embedded_terminal(self) -> None:
+        """「终端」按钮 = 展开内嵌终端并聚焦输入行（用户标定 2026-11-21，不再弹外部窗口）"""
+        if self.edit_term.isHidden():
+            self._toggle_log()
+        self.edit_term.setFocus()
 
     # ================================================ 功能页统一入口（统一执行管道）
     def run_git_job(self, fn, on_done=None) -> None:
@@ -319,6 +356,12 @@ class MainWindow(QMainWindow):
         run_async(job, on_done, parent=self, keep=self._workers)
 
     def _render_status(self, status: StatusInfo) -> None:
+        # git status 失败（如 index.lock 冲突）：保留旧列表 + 报错，绝不说“工作区干净”
+        if not status.ok:
+            self.label_cmd_text.setStyleSheet("color:#f48771;")
+            self.label_cmd_text.setText(
+                f"✗ 读取改动失败 —— {status.error}")
+            return
         self._last_status = status
         # 分支 + 领先/落后（工具栏）
         self._set_branch_text(status.branch)
@@ -334,9 +377,15 @@ class MainWindow(QMainWindow):
                 "⚠ 合并进行中：冲突文件都已标记解决，可完成合并提交",
                 "去处理", self._open_conflict_wizard)
         elif status.branch.detached:
-            self._show_banner(
-                "⚠ 你不在任何分支上（detached HEAD），提交可能丢",
-                "去分支页", lambda: self.tabs.setCurrentIndex(2))
+            ret = self._detach_return_branch
+            if ret:
+                self._show_banner(
+                    "⚠ 你正在“看旧版本”（detached HEAD）——点右侧按钮随时回家",
+                    f"回到 {ret}", lambda: self._switch_back(ret))
+            else:
+                self._show_banner(
+                    "⚠ 你不在任何分支上（detached HEAD），提交可能丢",
+                    "去分支页", lambda: self.tabs.setCurrentIndex(2))
         else:
             self.banner.hide()
         # 改动页 + 提交按钮 + 命令栏
@@ -491,7 +540,8 @@ class MainWindow(QMainWindow):
                     "它产生一个新的抵消提交，正常推送即可，历史不会被改写。")
                 return
 
-            def job():
+            def job(repo):
+                # run_git_job 的约定：fn(repo)
                 return repo.undo_last_commit()
 
             def on_done(rec):
@@ -517,8 +567,9 @@ class MainWindow(QMainWindow):
         if btn != QMessageBox.Yes:
             return
 
-        def job():
-            return self.repo.revert_last_commit()
+        def job(repo):
+            # run_git_job 的约定：fn(repo)
+            return repo.revert_last_commit()
 
         def on_done(rec):
             if isinstance(rec, CommandRecord) and rec.ok:
@@ -606,18 +657,51 @@ class MainWindow(QMainWindow):
             history.reload(self.repo)
         self.refresh_status()
 
+    # ================================================ 工具栏分支弹窗（IDEA 式，用户标定 2026-11-21）
+    def _open_branch_popup(self) -> None:
+        """点击工具栏分支名 → 搜索 + 滚动 + 右键菜单的分支弹窗（限高，80+ 分支不占屏）"""
+        if not self.repo:
+            return
+        repo = self.repo
+
+        def job():
+            return repo.branches()
+
+        def done(result):
+            if isinstance(result, Exception) or not result:
+                return
+            branch_page = self.pages.get("分支")
+            if not branch_page:
+                return
+            local, remote = result
+            popup = BranchPopup(branch_page, self)
+            popup.refresh(local, remote)
+            popup.move(self.label_branch.mapToGlobal(
+                self.label_branch.rect().bottomLeft()))
+            popup.show()
+            popup.raise_()
+            popup.edit_search.setFocus()
+
+        self.run_job(job, done)
+
+    def _switch_back(self, branch_name: str) -> None:
+        """detached 查看后一键回家"""
+        self._detach_return_branch = None
+        self.run_git_job(lambda repo: repo.switch_branch(branch_name), None)
+
     def _set_branch_text(self, branch) -> None:
         if branch is None or (not branch.name and not branch.detached):
-            self.label_branch.setText("分支：—")
-            self.label_branch.setStyleSheet("")
+            self.label_branch.setText("分支：— ▾")
+            self.label_branch.setStyleSheet(_BRANCH_BTN_STYLE)
             self.label_ab.setText("")
             return
         if branch.detached:
-            self.label_branch.setText("HEAD 游离（不在任何分支上）")
-            self.label_branch.setStyleSheet("color:#c0392b;")
+            self.label_branch.setText("HEAD 游离（不在任何分支上） ▾")
+            self.label_branch.setStyleSheet(
+                _BRANCH_BTN_STYLE + "QPushButton{color:#c0392b;}")
         else:
-            self.label_branch.setText(f"分支：{branch.name}")
-            self.label_branch.setStyleSheet("")
+            self.label_branch.setText(f"{branch.name} ▾")
+            self.label_branch.setStyleSheet(_BRANCH_BTN_STYLE)
         if branch.upstream:
             self.label_ab.setText(f"↑{branch.ahead} ↓{branch.behind}")
         else:

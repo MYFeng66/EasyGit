@@ -7,8 +7,9 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QFont, QPen
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QSplitter, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
+    QMenu, QMessageBox, QPushButton, QSplitter, QStyle,
+    QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from .. import register
@@ -125,6 +126,7 @@ class HistoryPage(QWidget):
         self._commits: list[Commit] = []
         self._skip = 0
         self._busy = False
+        self._pending_reload = False   # busy 期间收到的新仓库加载请求，done 里补跑
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -151,6 +153,9 @@ class HistoryPage(QWidget):
         self.list.setItemDelegate(GraphDelegate(self.list))
         self.list.itemClicked.connect(self._show_commit)
         self.list.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        # 右键：版本恢复（detached 查看 / 从版本建分支）
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._commit_menu)
         split.addWidget(self.list)
 
         right = QWidget()
@@ -163,6 +168,9 @@ class HistoryPage(QWidget):
         rv.addWidget(self.label_meta)
         self.list_files = QListWidget()
         self.list_files.itemClicked.connect(self._show_file_diff)
+        # 右键：把单个文件恢复成该版本的样子
+        self.list_files.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_files.customContextMenuRequested.connect(self._file_menu)
         rv.addWidget(self.list_files, 1)
         self.viewer_diff = DiffViewer()
         rv.addWidget(self.viewer_diff, 1)
@@ -194,11 +202,12 @@ class HistoryPage(QWidget):
             self._load(more=True)
 
     def _load(self, more: bool = False) -> None:
-        if not self._repo or self._busy:
+        if not self._repo:
             return
-        if not more:
-            self._skip = 0
-            self._commits = []
+        if self._busy:
+            # 正在加载旧仓库 → 挂起本次，done 里补跑（否则新仓库数据永远丢失）
+            self._pending_reload = True
+            return
         self._busy = True
         repo = self._repo
         skip = self._skip
@@ -208,6 +217,13 @@ class HistoryPage(QWidget):
 
         def done(result):
             self._busy = False
+            if self._pending_reload:
+                # 期间收到过新的加载请求（换仓库）→ 本结果作废，补跑新仓库
+                self._pending_reload = False
+                self.reload(self._repo)
+                return
+            if self._repo is not repo:
+                return          # 纯过期结果（无新请求）：丢弃
             if isinstance(result, Exception):
                 self.label_count.setText("读取提交历史失败")
                 return
@@ -255,6 +271,73 @@ class HistoryPage(QWidget):
                 self.list_files.addItem("（空提交或合并提交，未直接改文件）")
 
         self.ctx.run_job(job, done)
+
+    # ================================================ 版本恢复（右键菜单，2026-11-21）
+    def _commit_menu(self, pos) -> None:
+        item = self.list.itemAt(pos)
+        if not item:
+            return
+        c = item.data(COMMIT_ROLE)
+        if not c:
+            return
+        menu = QMenu(self)
+        act_view = menu.addAction("回到这个版本看看\n（HEAD 指过去，不改分支，随时一键回来）")
+        act_view.triggered.connect(lambda: self._checkout_version(c))
+        act_branch = menu.addAction("从这个版本创建新分支…")
+        act_branch.triggered.connect(lambda: self._branch_at_version(c))
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+    def _checkout_version(self, c) -> None:
+        """detached 查看旧版本：记住原分支，横幅提供一键回家"""
+        st = getattr(self.ctx, "_last_status", None)
+        if st and st.branch and not st.branch.detached and st.branch.name:
+            self.ctx._detach_return_branch = st.branch.name
+
+        def job(repo):
+            return repo.checkout_detached(c.hash)
+
+        self.ctx.run_git_job(job, None)   # 自动刷新 → 横幅出现
+
+    def _branch_at_version(self, c) -> None:
+        name, ok = QInputDialog.getText(
+            self, "从版本建分支",
+            f"从「{c.subject[:30]}」({c.short}) 创建新分支：",
+            text=f"version-{c.short}")
+        if not ok or not name.strip():
+            return
+        new_name = name.strip()
+
+        def job(repo):
+            return repo.switch_create_at(c.hash, new_name)
+
+        self.ctx.run_git_job(job, None)
+
+    def _file_menu(self, pos) -> None:
+        item = self.list_files.itemAt(pos)
+        if not item:
+            return
+        c_hash = item.data(FILE_HASH_ROLE)
+        path = item.data(FILE_PATH_ROLE)
+        if not (c_hash and path):
+            return
+        menu = QMenu(self)
+        act = menu.addAction("把这个文件恢复成该版本的样子\n（覆盖工作区的未提交改动）")
+        act.triggered.connect(lambda: self._restore_file(c_hash, path))
+        menu.exec(self.list_files.viewport().mapToGlobal(pos))
+
+    def _restore_file(self, c_hash: str, path: str) -> None:
+        btn = QMessageBox.question(
+            self, "恢复文件",
+            f"把「{path}」恢复成所选版本的样子？\n"
+            "工作区里这个文件的未提交改动将被覆盖。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if btn != QMessageBox.Yes:
+            return
+
+        def job(repo):
+            return repo.restore_file_from(c_hash, path)
+
+        self.ctx.run_git_job(job, None)
 
     def _show_file_diff(self, item: QListWidgetItem) -> None:
         c_hash = item.data(FILE_HASH_ROLE)

@@ -10,6 +10,7 @@ git 封装层：EasyGit 与 git 唯一的对话通道（技术选型定案：直
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,8 @@ class StatusInfo:
     """一次 git status 的完整结构化结果"""
     branch: BranchInfo = field(default_factory=BranchInfo)
     files: list[GitFile] = field(default_factory=list)
+    ok: bool = True          # git status 是否执行成功（失败时 files 为空但不可当成“干净”）
+    error: str = ""          # 失败原因首行
 
 
 @dataclass
@@ -96,6 +99,13 @@ class BranchEntry:
     upstream: str = ""          # 跟踪的远端分支，如 "origin/main"
     is_head: bool = False        # 是否当前分支
     is_remote: bool = False      # 是否远端分支（origin/xxx）
+
+
+@dataclass
+class StashEntry:
+    """储藏（stash）里的一条存档"""
+    ref: str          # stash@{0}
+    message: str      # On master: EasyGit：切换到 xxx 前自动暂存
 
 
 # ================= 封装层本体 =================
@@ -140,10 +150,17 @@ class GitRepo:
 
     # ---- 能力 1：状态（v1 #1 改动页的数据源） ----
     def status(self) -> StatusInfo:
-        """git status 的结构化版本"""
+        """git status 的结构化版本。
+        失败（如 index.lock 被并发 git 进程占用）时 ok=False、files 为空；
+        对 index.lock 重试一次，避开瞬时冲突。"""
         info = StatusInfo()
         rec = self.run_git(["status", "--porcelain=v1", "-b"])
+        if not rec.ok and "index.lock" in rec.output:
+            time.sleep(0.4)                    # 等并发进程放锁，重试一次
+            rec = self.run_git(["status", "--porcelain=v1", "-b"])
         if not rec.ok:
+            info.ok = False
+            info.error = rec.output.splitlines()[0] if rec.output else "git status 执行失败"
             return info
         for line in rec.output.splitlines():
             line = line.rstrip("\n")
@@ -286,8 +303,10 @@ class GitRepo:
                            "refs/remotes"])
         if r2.ok:
             for line in r2.output.splitlines():
-                if line.strip():
-                    rem.append(BranchEntry(name=line.strip(), is_remote=True))
+                name = line.strip()
+                # origin/HEAD 的短名是不带斜杠的 "origin"，不是真分支 → 跳过
+                if name and "/" in name:
+                    rem.append(BranchEntry(name=name, is_remote=True))
         return loc, rem
 
     def switch_branch(self, name: str) -> CommandRecord:
@@ -301,8 +320,50 @@ class GitRepo:
         return self.run_git(["branch", "-d", name])
 
     def stash_push(self, message: str) -> CommandRecord:
-        """切分支守卫的「先暂存」选项（幕后 git stash push）"""
-        return self.run_git(["stash", "push", "-m", message])
+        """切分支守卫的「先暂存」选项（幕后 git stash push）。
+        -u 连未跟踪文件一起入储藏——未跟踪文件挡路时，不带 -u 的 stash 根本解决不了。"""
+        return self.run_git(["stash", "push", "-u", "-m", message])
+
+    def stash_list(self) -> list[StashEntry]:
+        """储藏清单（改动页「储藏…」按钮的数据源）"""
+        rec = self.run_git(["stash", "list"])
+        entries: list[StashEntry] = []
+        if rec.ok:
+            for line in rec.output.splitlines():
+                if not line.strip():
+                    continue
+                ref, _, msg = line.partition(":")
+                entries.append(StashEntry(ref=ref.strip(), message=msg.strip()))
+        return entries
+
+    def stash_pop(self, ref: str) -> CommandRecord:
+        """取回储藏：改动放回工作区，并从储藏删除（有冲突时 git 会保留条目）"""
+        return self.run_git(["stash", "pop", ref])
+
+    def stash_drop(self, ref: str) -> CommandRecord:
+        """丢弃一条储藏（内容真的会丢，界面必须先确认）"""
+        return self.run_git(["stash", "drop", ref])
+
+    # ---- 能力 9：仅本地文件（F 类痛点，2026-11-21 用户实战倒逼提前实装）----
+    def mark_local(self, paths: list[str]) -> CommandRecord:
+        """标记「仅本地」：改动不再显示、不会被提交/推送（幕后 skip-worktree）。
+        注意：git 切分支时仍会拒绝覆盖这类文件——需要配合备份/复原五步舞（见 branch_page）。"""
+        return self.run_git(["update-index", "--skip-worktree", *paths])
+
+    def unmark_local(self, paths: list[str]) -> CommandRecord:
+        """解除「仅本地」标记（五步舞第一步：让 git 正常看见并处理这些文件）"""
+        return self.run_git(["update-index", "--no-skip-worktree", *paths])
+
+    def restore_paths(self, paths: list[str]) -> CommandRecord:
+        """把文件恢复为当前分支 HEAD 的版本（丢弃本地改动，切换前清障用）"""
+        return self.run_git(["restore", "--source=HEAD", "--", *paths])
+
+    def tracked_subset(self, paths: list[str]) -> list[str]:
+        """返回这些路径中当前被 git 跟踪的子集（判断挡路文件是跟踪还是未跟踪）"""
+        rec = self.run_git(["ls-files", "--", *paths])
+        if not rec.ok:
+            return []
+        return [line.strip() for line in rec.output.splitlines() if line.strip()]
 
     # ---- 能力 8：冲突与分支对比（v1 #6/#9） ----
     def merge_in_progress(self) -> bool:
@@ -335,6 +396,19 @@ class GitRepo:
         rec = self.run_git(["diff", a, b, "--", path])
         return rec.output if rec.ok else ""
 
+    # ---- 能力 10：版本恢复（历史页右键，2026-11-21 用户需求：HEAD 指向哪个版本）----
+    def checkout_detached(self, commit_hash: str) -> CommandRecord:
+        """把 HEAD 指到某提交「回到那个版本看看」（detached，不动任何分支，随时可回）"""
+        return self.run_git(["switch", "-d", commit_hash])
+
+    def switch_create_at(self, commit_hash: str, new_branch: str) -> CommandRecord:
+        """从某个历史版本创建新分支（在旧版本上安全开工）"""
+        return self.run_git(["switch", "-c", new_branch, commit_hash])
+
+    def restore_file_from(self, commit_hash: str, path: str) -> CommandRecord:
+        """把工作区某文件恢复成指定版本的样子（覆盖未提交改动，界面需确认）"""
+        return self.run_git(["restore", "--source", commit_hash, "--", path])
+
 
 def _parse_branch_line(text: str) -> BranchInfo:
     """解析 '## main...origin/main [ahead 2, behind 1]' 这类行"""
@@ -360,6 +434,25 @@ def _parse_branch_line(text: str) -> BranchInfo:
         # "## main" 或 "## No commits yet on main"
         b.name = text.split()[-1] if text else ""
     return b
+
+
+def files_blocked_by_switch(output: str) -> list[str]:
+    """从 git switch/checkout 的拒绝信息中解析挡路文件清单。
+    兼容 tracked（Your local changes…）与 untracked（untracked working tree files…）两种措辞。"""
+    files: list[str] = []
+    collecting = False
+    for line in output.splitlines():
+        if "would be overwritten by checkout" in line:
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        s = line.strip()
+        if not s or s.startswith(("Please", "Aborting", "error", "fatal")):
+            collecting = False
+            continue
+        files.append(s)
+    return files
 
 
 def clone_repo(url: str, target: str) -> CommandRecord:

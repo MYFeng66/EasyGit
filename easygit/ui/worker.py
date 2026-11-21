@@ -26,9 +26,16 @@ class GitWorker(QThread):
 
 def run_async(fn, on_done, parent, keep: list) -> None:
     """在后台跑 fn，完成后回 UI 线程调 on_done(结果)。
-    keep：外部的引用列表，防止 Python 侧被垃圾回收提前掐死线程。"""
+    keep：外部的引用列表，防止 Python 侧被垃圾回收提前掐死线程；
+    线程结束时自动从列表移除（否则每次点击泄漏一个引用）。"""
     worker = GitWorker(fn, parent=parent)
     worker.done.connect(on_done)
+
+    def _cleanup():
+        if worker in keep:
+            keep.remove(worker)
+
     worker.finished.connect(worker.deleteLater)
+    worker.finished.connect(_cleanup)
     keep.append(worker)
     worker.start()

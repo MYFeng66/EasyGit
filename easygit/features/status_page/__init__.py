@@ -1,135 +1,308 @@
 # -*- coding: utf-8 -*-
-"""「改动」页 v0.4：单列表 + 双状态列 + 右侧 diff/源码/预览查看器。
-勾上 = 纳入下次提交（幕后 git add）；取消 = 拿出（幕后 git restore --staged）。"""
+"""「改动」页 v0.5：两区（已修改 / 已加入）+ 目录树（Explorer 式，2026-11-21 用户标定）。
+
+* 左侧上下两区：已修改（工作区） / 已加入（下次提交），勾选让文件在区间流动
+* 文件按目录树组织、可展开折叠；列 = 名称 | 类型 | 状态
+* 勾上 = 纳入下次提交（幕后 git add）；取消 = 拿出（幕后 git restore --staged）
+"""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLabel, QPushButton, QSplitter,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHBoxLayout, QHeaderView, QLabel, QPushButton, QSplitter, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import register
-from ...core.git_wrapper import StatusInfo
+from ...core.git_wrapper import GitFile, StatusInfo
 from ...ui.diff_viewer import DiffViewer
+from ...ui.stash_dialog import StashDialog
 
-PATH_ROLE = Qt.UserRole + 1
-GROUP_ROLE = Qt.UserRole + 2
+PATH_ROLE = Qt.UserRole + 1      # 完整相对路径（文件行）
+OGROUP_ROLE = Qt.UserRole + 2     # git 侧的原始分组（untracked/conflict/…）
+DIRPATHS_ROLE = Qt.UserRole + 3    # 目录行：它下面所有（非冲突）文件的路径列表
 
-# 专业用词（用户标定：拒绝口水词）：工作区列 = 文件当前状态
+# 专业用词（用户标定：拒绝口水词）
 WORKTREE_TEXT = {"M": "已修改", "D": "已删除", "R": "已重命名", "A": "新增", "?": "未跟踪"}
+
+
+def _debug_log(msg: str) -> None:
+    """改动页诊断日志（排查“文件列表消失”类问题用，可随时删除）"""
+    try:
+        log = Path.home() / ".easygit" / "debug.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def _zone_term(f: GitFile, add_zone: bool) -> str:
+    """状态列：已加入区看暂存码 x；已修改区看工作区码 y"""
+    if not add_zone:
+        if f.group == "untracked":
+            return "未跟踪"
+        if f.group == "conflict":
+            return "冲突"
+    return WORKTREE_TEXT.get(f.x if add_zone else f.y, "改动")
+
+
+def _ext_of(path: str) -> str:
+    suffix = Path(path).suffix
+    return suffix if suffix else "（无扩展名）"
+
+
+class ZonePanel(QWidget):
+    """一个分区：标题行（数量 + 批量按钮）+ 目录树"""
+
+    def __init__(self, title: str, color: str, batch_text: str,
+                 on_batch, on_toggle, on_click):
+        super().__init__()
+        self.base_title = title
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+
+        bar = QHBoxLayout()
+        bar.setContentsMargins(6, 4, 6, 2)
+        self.bar = bar          # 暴露给页面：可追加按钮（如「储藏…」）
+        self.label_title = QLabel(title)
+        font = QFont()
+        font.setBold(True)
+        self.label_title.setFont(font)
+        self.label_title.setStyleSheet(f"color:{color};")
+        self.btn_batch = QPushButton(batch_text)
+        self.btn_batch.clicked.connect(on_batch)
+        bar.addWidget(self.label_title)
+        bar.addStretch(1)
+        bar.addWidget(self.btn_batch)
+        v.addLayout(bar)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["名称", "类型", "状态"])
+        self.tree.setRootIsDecorated(True)
+        # 行内边距——视觉上不再逼仄（用户标定 2026-11-21）
+        self.tree.setStyleSheet("QTreeWidget::item{padding:3px 0;}")
+        # 列宽规则（用户标定）：名称列弹性占满剩余空间；Qt 默认会拉伸【最后一列】，
+        # 导致“状态”列吞掉所有宽度——必须关掉，改成名称列拉伸
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.tree.itemChanged.connect(on_toggle)
+        self.tree.itemClicked.connect(on_click)
+        v.addWidget(self.tree, 1)
 
 
 class StatusPage(QWidget):
     def __init__(self, ctx):
         super().__init__()
-        self.ctx = ctx                    # 主窗口：提供 run_git_job（统一执行管道）
-        self._busy = False                # 后台操作进行中时，忽略新勾选
-        self._status = None               # 最近一次状态（供“全部勾选/取消”用）
+        self.ctx = ctx
+        self._busy = False
+        self._mod_files: list[GitFile] = []   # 已修改区文件（含未跟踪/冲突）
+        self._add_files: list[GitFile] = []   # 已加入区文件
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         split = QSplitter(Qt.Horizontal)
 
-        left = QWidget()
-        v = QVBoxLayout(left)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(4)
+        left = QSplitter(Qt.Vertical)
+        self.zone_mod = ZonePanel(
+            "已修改（工作区）", "#0d47a1", "全部加入",
+            self._stage_all, self._on_toggle_mod, self._on_file_click)
+        self.zone_add = ZonePanel(
+            "已加入（下次提交）", "#1b5e20", "全部移出",
+            self._unstage_all, self._on_toggle_add, self._on_file_click)
+        left.addWidget(self.zone_mod)
+        left.addWidget(self.zone_add)
+        left.setSizes([320, 180])
+        # 文件目录区（已修改）应比已加入区大（用户标定 2026-11-21）
+        left.setStretchFactor(0, 2)
+        left.setStretchFactor(1, 1)
 
-        # 顶部操作行
-        top = QHBoxLayout()
-        top.addWidget(QLabel("文件改动"))
-        top.addStretch(1)
-        btn_all = QPushButton("全部勾选")
-        btn_all.clicked.connect(self._stage_all)
-        btn_none = QPushButton("全部取消")
-        btn_none.clicked.connect(self._unstage_all)
-        top.addWidget(btn_all)
-        top.addWidget(btn_none)
-        v.addLayout(top)
+        # 储藏入口：改动去哪了 → 在这里找回来（2026-11-21 用户需求）
+        btn_stash = QPushButton("储藏…")
+        btn_stash.clicked.connect(self._open_stash)
+        self.zone_mod.bar.insertWidget(2, btn_stash)   # 批量按钮左侧
 
-        note = QLabel("勾选 = 纳入下次提交；「工作区」显示文件当前状态，「下次提交」显示它是否在本次提交中")
-        note.setStyleSheet("color:#888;")
-        v.addWidget(note)
-
-        self.hint = QLabel("")
-        self.hint.setStyleSheet("color:#888;")
-        self.hint.hide()
-        v.addWidget(self.hint)
-
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["文件", "工作区", "下次提交"])
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tree.itemChanged.connect(self._on_item_changed)
-        self.tree.itemClicked.connect(self._show_file_diff)
-        v.addWidget(self.tree, 1)
-
-        # 右侧：diff / 源码 / 预览 公共查看器（与文件列表可拖动分割）
         split.addWidget(left)
         self.viewer = DiffViewer()
         split.addWidget(self.viewer)
-        split.setSizes([460, 540])
+        split.setSizes([680, 400])
         root.addWidget(split)
 
-    # ---- 对外接口：主窗口刷新时调用 ----
+    # ================================================ 对外接口：主窗口刷新时调用
     def show_message(self, text: str) -> None:
-        """空状态提示（如：还没打开仓库 / 工作区干净）"""
-        self.tree.clear()
-        self.hint.setText(text)
-        self.hint.show()
+        """还没打开仓库等场景"""
+        _debug_log(f"列表被清空并显示提示：{text}")
+        for panel in (self.zone_mod, self.zone_add):
+            panel.tree.clear()
+            panel.label_title.setText(panel.base_title)
+        self.zone_mod.tree.addTopLevelItem(
+            QTreeWidgetItem([text, "", ""]))
+        self._mod_files = []
+        self._add_files = []
 
     def refresh_from(self, status: StatusInfo) -> None:
-        self._busy = False               # 每次刷新解除 busy（可自愈任何卡住的状态）
-        self._status = status
-        vbar = self.tree.verticalScrollBar()   # 记住滚动位置，重绘后还原
-        scroll = vbar.value()
+        _debug_log(f"refresh_from：ok={status.ok} 文件数={len(status.files)}")
+        self._busy = False
+        self._mod_files = [f for f in status.files if f.group != "staged"]
+        self._add_files = [f for f in status.files if f.group == "staged"]
+        self._build_zone(self.zone_mod, self._mod_files, add_zone=False,
+                         empty_text="工作区很干净，没有待处理的改动")
+        self._build_zone(self.zone_add, self._add_files, add_zone=True,
+                         empty_text="还没有加入任何文件")
 
-        self.hint.hide()
-        self.tree.blockSignals(True)
-        self.tree.clear()
-        if not status.files:
-            self.tree.blockSignals(False)
-            self.show_message("工作区很干净，没有待处理的改动")
+    # ================================================ 目录树渲染
+    def _build_zone(self, panel: ZonePanel, files: list[GitFile],
+                    add_zone: bool, empty_text: str) -> None:
+        tree = panel.tree
+        tree.blockSignals(True)
+        scroll = tree.verticalScrollBar().value()
+        tree.clear()
+        panel.label_title.setText(f"{panel.base_title}（{len(files)}）")
+
+        if not files:
+            tree.blockSignals(False)
+            tree.addTopLevelItem(QTreeWidgetItem([empty_text, "", ""]))
+            tree.verticalScrollBar().setValue(0)
             return
 
-        # 单列表：每个文件固定一行，勾选只改「下次提交」列，不跳动分组
-        for f in status.files:
-            group = f.group
-            if group == "conflict":
-                wt, nxt = "冲突", "待处理"
-            elif group == "untracked":
-                wt, nxt = "未跟踪", "—"
-            elif group == "staged":
-                wt = WORKTREE_TEXT.get(f.y, "—") if f.y != " " else "—"
-                nxt = "已加入"
-            else:  # unstaged
-                wt = WORKTREE_TEXT.get(f.y, "改动")
-                nxt = "—"
-            child = QTreeWidgetItem([f.path, wt, nxt])
-            child.setData(0, PATH_ROLE, f.path)
-            child.setData(0, GROUP_ROLE, group)
-            if group == "conflict":
-                # 冲突文件不能直接勾选——留给冲突向导处理
-                for col in (0, 1, 2):
-                    child.setForeground(col, QBrush(QColor("#c0392b")))
-            else:
-                # 勾选即提交：勾选框状态 = git 暂存区的真实状态
-                child.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.Checked if group == "staged" else Qt.Unchecked)
-            self.tree.addTopLevelItem(child)
-        self.tree.blockSignals(False)
-        vbar.setValue(scroll)
+        # 递归建目录结构：嵌套 dict，叶子 = GitFile
+        nested: dict = {}
+        for f in files:
+            parts = Path(f.path).parts
+            d = nested
+            for part in parts[:-1]:
+                d = d.setdefault(part, {})
+            d[parts[-1]] = f
 
+        def collect_files(d: dict) -> list:
+            out = []
+            for v in d.values():
+                if isinstance(v, dict):
+                    out.extend(collect_files(v))
+                else:
+                    out.append(v)
+            return out
+
+        def render(d: dict, parent) -> None:
+            for name, val in d.items():
+                if isinstance(val, dict):          # 子目录
+                    dir_item = QTreeWidgetItem(parent, [name, "文件夹", ""])
+                    # 目录也可整体勾选（2026-11-21 用户标定）：勾选 = 勾选全部下属文件
+                    paths = [f.path for f in collect_files(val)
+                             if f.group != "conflict"]
+                    if paths:
+                        dir_item.setData(0, DIRPATHS_ROLE, paths)
+                        dir_item.setFlags(
+                            Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                            | Qt.ItemIsUserCheckable)
+                        dir_item.setCheckState(
+                            0, Qt.Checked if add_zone else Qt.Unchecked)
+                    else:
+                        dir_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    render(val, dir_item)
+                    dir_item.setExpanded(True)
+                else:                              # 文件
+                    f: GitFile = val
+                    child = QTreeWidgetItem(
+                        parent, [name, _ext_of(f.path), _zone_term(f, add_zone)])
+                    child.setData(0, PATH_ROLE, f.path)
+                    child.setData(0, OGROUP_ROLE, f.group)
+                    if f.group == "conflict":
+                        # 冲突文件不能直接勾选——留给冲突向导处理
+                        for col in (0, 1, 2):
+                            child.setForeground(col, QBrush(QColor("#c0392b")))
+                        child.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    else:
+                        # 勾选即提交：勾选框状态 = git 暂存区的真实状态
+                        child.setFlags(
+                            Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                            | Qt.ItemIsUserCheckable)
+                        child.setCheckState(
+                            0, Qt.Checked if add_zone else Qt.Unchecked)
+
+        render(nested, tree)
+        tree.blockSignals(False)
+        tree.verticalScrollBar().setValue(scroll)
+
+    # ================================================ 勾选交互（勾选即提交）
+    def _on_toggle_mod(self, item: QTreeWidgetItem, col: int) -> None:
+        self._toggle(item, col, stage=True)
+
+    def _on_toggle_add(self, item: QTreeWidgetItem, col: int) -> None:
+        self._toggle(item, col, stage=False)
+
+    def _toggle(self, item: QTreeWidgetItem, col: int, stage: bool) -> None:
+        if col != 0:
+            return
+        path = item.data(0, PATH_ROLE)
+        dir_paths = item.data(0, DIRPATHS_ROLE)
+        if path is None and not dir_paths:
+            return
+        paths = [path] if path else list(dir_paths)
+        if not paths:
+            return
+        if self._busy:
+            # 后台操作进行中：把这次勾选视觉上退回去（真实状态稍后自动刷新）
+            tree = item.treeWidget()
+            tree.blockSignals(True)
+            item.setCheckState(
+                0, Qt.Unchecked if item.checkState(0) == Qt.Checked else Qt.Checked)
+            tree.blockSignals(False)
+            return
+        self._busy = True
+
+        def job(repo):
+            # 幕后执行 git add / git restore --staged（目录 = 一次批量），命令栏照实显示
+            return repo.stage(paths) if stage else repo.unstage(paths)
+
+        def done(rec):
+            self._busy = False    # 主窗口会自动刷新，文件在两区间流动
+
+        self.ctx.run_git_job(job, done)
+
+    def _stage_all(self) -> None:
+        paths = [f.path for f in self._mod_files if f.group != "conflict"]
+        if not paths or self._busy:
+            return
+        self._busy = True
+
+        def done(rec):
+            self._busy = False
+
+        self.ctx.run_git_job(lambda repo: repo.stage(paths), done)
+
+    def _unstage_all(self) -> None:
+        paths = [f.path for f in self._add_files]
+        if not paths or self._busy:
+            return
+        self._busy = True
+
+        def done(rec):
+            self._busy = False
+
+        self.ctx.run_git_job(lambda repo: repo.unstage(paths), done)
 
     # ================================================ 单文件查看（diff / 源码 / 预览）
-    def _show_file_diff(self, item: QTreeWidgetItem, col: int) -> None:
+    # ================================================ 储藏管理
+    def _open_stash(self) -> None:
+        """储藏对话框：列出/取回/丢弃 stash（存得进，必须取得出）"""
+        if not self.ctx.repo:
+            return
+        dlg = StashDialog(self.ctx, self)
+        dlg.exec()
+        self.ctx.refresh_status()
+
+    def _on_file_click(self, item: QTreeWidgetItem, col: int) -> None:
         path = item.data(0, PATH_ROLE)
-        group = item.data(0, GROUP_ROLE)
+        group = item.data(0, OGROUP_ROLE)
         if not path or not self.ctx.repo:
             return
         repo = self.ctx.repo
@@ -158,57 +331,6 @@ class StatusPage(QWidget):
                                     source_text=source)
 
         self.ctx.run_job(job, done)
-
-    # ================================================ 勾选交互（勾选即提交）
-    def _on_item_changed(self, item: QTreeWidgetItem, col: int) -> None:
-        if col != 0 or item.data(0, PATH_ROLE) is None:
-            return
-        if self._busy:
-            # 后台操作进行中：把这次勾选视觉上退回去（git 真实状态稍后自动刷新）
-            self.tree.blockSignals(True)
-            item.setCheckState(
-                0, Qt.Unchecked if item.checkState(0) == Qt.Checked else Qt.Checked)
-            self.tree.blockSignals(False)
-            return
-        want_stage = item.checkState(0) == Qt.Checked
-        path = item.data(0, PATH_ROLE)
-        self._busy = True
-
-        def job(repo):
-            # 幕后执行 git add / git restore --staged，命令栏照实显示
-            return repo.stage([path]) if want_stage else repo.unstage([path])
-
-        def done(rec):
-            self._busy = False
-
-        self.ctx.run_git_job(job, done)
-
-    def _stage_all(self) -> None:
-        if self._busy or not self._status:
-            return
-        paths = [f.path for f in self._status.files
-                 if f.group in ("unstaged", "untracked")]
-        if not paths:
-            return
-        self._busy = True
-
-        def done(rec):
-            self._busy = False
-
-        self.ctx.run_git_job(lambda repo: repo.stage(paths), done)
-
-    def _unstage_all(self) -> None:
-        if self._busy or not self._status:
-            return
-        paths = [f.path for f in self._status.files if f.group == "staged"]
-        if not paths:
-            return
-        self._busy = True
-
-        def done(rec):
-            self._busy = False
-
-        self.ctx.run_git_job(lambda repo: repo.unstage(paths), done)
 
 
 def create_page(ctx) -> QWidget:

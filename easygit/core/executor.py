@@ -38,6 +38,9 @@ ERROR_HINTS = [
     ("non-fast-forward", "远端有你没有的新提交，先拉取再推送。"),
     ("nothing to commit", "没有勾选任何改动，先在改动页勾文件。"),
     ("ambiguous argument 'HEAD~1'", "仓库里只有一个提交，没有更早的提交可撤销。"),
+    ("invalid reference", "没有这个分支/引用——注意仓库的主干可能叫 main 而不是 master"
+     "（老教程用 master，新版 git/GitHub 默认 main，以 git branch 实际列表为准）"),
+    ("Unable to mark file", "该文件未被跟踪，不能用「仅本地」标记——请改用 stash 或提交。"),
 ]
 
 

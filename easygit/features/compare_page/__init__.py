@@ -9,8 +9,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QPushButton, QSplitter, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSplitter,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import register
@@ -56,6 +56,10 @@ class ComparePage(QWidget):
         split = QSplitter(Qt.Horizontal)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["路径", "状态"])
+        # 关掉“最后一列拉伸”默认行为：路径列才该是弹性列
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tree.itemClicked.connect(self._show_diff)
         split.addWidget(self.tree)
         self.viewer = DiffViewer()
@@ -75,6 +79,8 @@ class ComparePage(QWidget):
             return repo.branches()
 
         def done(result):
+            if self._repo is not repo:
+                return          # 过期仓库的结果，丢弃
             if isinstance(result, Exception) or not result:
                 return
             local, remote = result
