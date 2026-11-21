@@ -18,6 +18,8 @@ def _import_builtin_features() -> None:
     # 每个功能一行 import 即入列；删功能 = 删掉对应行
     from . import status_page    # noqa: F401  「改动」页
     from . import history_page   # noqa: F401  「历史」页
+    from . import branch_page    # noqa: F401  「分支」页
+    from . import compare_page   # noqa: F401  「对比」页
 
 
 _import_builtin_features()

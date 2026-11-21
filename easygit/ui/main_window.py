@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import subprocess
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSplitter, QTabWidget,
-    QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .. import features
@@ -20,6 +20,8 @@ from ..core import settings as settings_mod
 from ..core.executor import CommandLog, translate_error
 from ..core.git_wrapper import CommandRecord, GitRepo, StatusInfo
 from ..core.shell import run_shell
+from .add_repo_dialog import AddRepoDialog
+from .conflict_dialog import ConflictDialog
 from .worker import run_async
 
 
@@ -37,9 +39,18 @@ class MainWindow(QMainWindow):
         self._staged_count = 0          # 已勾选、将提交的文件数（驱动提交按钮）
         self._shown_log = 0             # 已写入日志面板的条数
         self._term_cwd = None            # 内嵌终端会话目录（cd 持久，切仓库时重置）
+        self._last_status: StatusInfo | None = None    # 最近状态（守卫/推拉判断用）
+        self._repo_has_remote = False    # 当前仓库有没有远端
+        self._banner_action = None       # 提示条按钮当前动作
 
         self._build_ui()
         self._reload_repos()
+
+        # fetch 自动（第七章 2：只读零风险，每 5 分钟一次）
+        self._fetch_timer = QTimer(self)
+        self._fetch_timer.setInterval(5 * 60 * 1000)
+        self._fetch_timer.timeout.connect(self._auto_fetch)
+        self._fetch_timer.start()
 
     # ================================================ 界面搭建
     def _build_ui(self) -> None:
@@ -58,12 +69,18 @@ class MainWindow(QMainWindow):
         self.label_branch = QLabel("分支：—")
         self.label_ab = QLabel("")
         self.label_ab.setStyleSheet("color:#1565c0;")
+        btn_pull = QPushButton("拉取")
+        btn_pull.clicked.connect(self._pull)
+        btn_push = QPushButton("推送")
+        btn_push.clicked.connect(self._push)
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(self.refresh_status)
         btn_terminal = QPushButton("外部终端")
         btn_terminal.clicked.connect(self.open_terminal)
         hbar.addWidget(self.label_branch)
         hbar.addWidget(self.label_ab)
+        hbar.addWidget(btn_pull)
+        hbar.addWidget(btn_push)
         hbar.addWidget(btn_refresh)
         hbar.addStretch(1)
         hbar.addWidget(btn_terminal)
@@ -79,7 +96,8 @@ class MainWindow(QMainWindow):
         self.label_banner = QLabel("⚠")
         self.label_banner.setStyleSheet("color:#8a6d00;")
         btn_banner = QPushButton("去处理")
-        btn_banner.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
+        self.btn_banner = btn_banner
+        btn_banner.clicked.connect(self._banner_click)
         hb.addWidget(self.label_banner)
         hb.addStretch(1)
         hb.addWidget(btn_banner)
@@ -110,15 +128,6 @@ class MainWindow(QMainWindow):
             page = f["create"](self)
             self.pages[f["title"]] = page
             self.tabs.addTab(page, f["title"])
-        # 尚未实现的功能占位页
-        for title, note in (
-            ("分支", "分支列表 + 切换守卫 + 上游关联"),
-            ("对比", "两个分支的差异文件清单"),
-        ):
-            ph = QLabel(f"{note}\n（下一个里程碑）")
-            ph.setAlignment(Qt.AlignCenter)
-            ph.setStyleSheet("color:#888;")
-            self.tabs.addTab(ph, title)
         split.addWidget(self.tabs)
         split.setSizes([180, 900])
 
@@ -135,6 +144,14 @@ class MainWindow(QMainWindow):
         self.edit_msg.returnPressed.connect(self._commit)   # ≤3 秒流程：消息写完回车即提交
         hc.addWidget(self.edit_msg, 1)
         hc.addWidget(self.btn_commit)
+        self.btn_undo = QPushButton("撤销 ▾")
+        undo_menu = QMenu(self)
+        act_undo = undo_menu.addAction("撤销上次提交（改动保留，未推送时用）")
+        act_revert = undo_menu.addAction("反提交抵消上次提交（已推送时用）")
+        act_undo.triggered.connect(self._undo_last_commit)
+        act_revert.triggered.connect(self._revert_last_commit)
+        self.btn_undo.setMenu(undo_menu)
+        hc.addWidget(self.btn_undo)
 
         # ---- 命令与日志栏：可展开如终端（第六章 5 升级，2026-11-20 标定） ----
         log_pane = QWidget()
@@ -214,15 +231,21 @@ class MainWindow(QMainWindow):
             return
         self.repo = GitRepo(path, self.log)
         self._term_cwd = path             # 切仓库时重置终端会话目录
-        history = self.pages.get("历史")
-        if history:
-            history.reload(self.repo)     # 历史树随仓库切换加载
+        self._repo_has_remote = self.repo.has_remote()
+        # 各功能页随仓库切换加载
+        for key in ("历史", "分支", "对比"):
+            page = self.pages.get(key)
+            if page:
+                page.reload(self.repo)
         self.setWindowTitle(f"EasyGit —— {path}")
+        self._auto_fetch()                # 启动即取件一次（fetch 自动）
         self.refresh_status()
 
     def add_repo(self) -> None:
-        """v1 #7 的一角：添加仓库（向导化、平台识别后续里程碑做）"""
-        path = QFileDialog.getExistingDirectory(self, "选择一个 git 仓库文件夹")
+        """v1 #7：添加仓库向导（本地打开 / 从 URL 克隆，凭据走系统）"""
+        dlg = AddRepoDialog(self)
+        dlg.exec()
+        path = dlg.result_path
         if not path:
             return
         repos = self.settings.setdefault("repos", [])
@@ -296,18 +319,24 @@ class MainWindow(QMainWindow):
         run_async(job, on_done, parent=self, keep=self._workers)
 
     def _render_status(self, status: StatusInfo) -> None:
+        self._last_status = status
         # 分支 + 领先/落后（工具栏）
         self._set_branch_text(status.branch)
-        # 提示条：仅异常出现（冲突中 / detached HEAD）
+        # 提示条：仅异常出现（第七章 4 触发规则）
         conflicts = [f for f in status.files if f.group == "conflict"]
+        merging = bool(self.repo and self.repo.merge_in_progress())
         if conflicts:
-            self.label_banner.setText(
-                f"⚠ 你处于合并冲突中：还剩 {len(conflicts)} 个文件没解决")
-            self.banner.show()
+            self._show_banner(
+                f"⚠ 你处于合并冲突中：还剩 {len(conflicts)} 个文件没解决",
+                "去处理", self._open_conflict_wizard)
+        elif merging:
+            self._show_banner(
+                "⚠ 合并进行中：冲突文件都已标记解决，可完成合并提交",
+                "去处理", self._open_conflict_wizard)
         elif status.branch.detached:
-            self.label_banner.setText(
-                "⚠ 你不在任何分支上（detached HEAD），提交可能丢")
-            self.banner.show()
+            self._show_banner(
+                "⚠ 你不在任何分支上（detached HEAD），提交可能丢",
+                "去分支页", lambda: self.tabs.setCurrentIndex(2))
         else:
             self.banner.hide()
         # 改动页 + 提交按钮 + 命令栏
@@ -440,6 +469,142 @@ class MainWindow(QMainWindow):
                     history.reload(self.repo)   # 历史树同步最新提交
 
         self.run_git_job(lambda repo: repo.commit(msg), on_done)
+
+    # ================================================ 撤销三件套（v1 #2 后半，痛点 C）
+    def _undo_last_commit(self) -> None:
+        """撤销上次提交：改动回到「已勾选」。已推送则拦下并引导改用反提交（防呆：避免本地与远端分叉）"""
+        if not self.repo:
+            return
+        repo = self.repo
+
+        def check():
+            return repo.is_head_pushed()
+
+        def on_checked(result):
+            if isinstance(result, Exception):
+                return
+            if result:
+                QMessageBox.information(
+                    self, "上次提交已推送",
+                    "上次提交已经在远端了，直接撤销会让本地和远端分叉。\n\n"
+                    "请改用菜单第二项「反提交抵消上次提交」：\n"
+                    "它产生一个新的抵消提交，正常推送即可，历史不会被改写。")
+                return
+
+            def job():
+                return repo.undo_last_commit()
+
+            def on_done(rec):
+                if isinstance(rec, CommandRecord) and rec.ok:
+                    history = self.pages.get("历史")
+                    if history:
+                        history.reload(self.repo)
+
+            self.run_git_job(job, on_done)
+
+        self.run_job(check, on_checked)
+
+    def _revert_last_commit(self) -> None:
+        """反提交抵消上次提交（第八章：需确认并解释「产生新提交，非删历史」）"""
+        if not self.repo:
+            return
+        btn = QMessageBox.question(
+            self, "确认反提交",
+            "这会产生一个新的「抵消提交」，效果上撤销上次提交的全部改动。\n"
+            "历史不会被删除（已推送的提交本来也不该删），推送后远端同步。\n\n"
+            "继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if btn != QMessageBox.Yes:
+            return
+
+        def job():
+            return self.repo.revert_last_commit()
+
+        def on_done(rec):
+            if isinstance(rec, CommandRecord) and rec.ok:
+                history = self.pages.get("历史")
+                if history:
+                    history.reload(self.repo)
+
+        self.run_git_job(job, on_done)
+
+    # ================================================ 提示条与远程同步（v1 #3/#6）
+    def _banner_click(self) -> None:
+        if self._banner_action:
+            self._banner_action()
+
+    def _show_banner(self, text: str, btn_text: str, action) -> None:
+        self.label_banner.setText(text)
+        self.btn_banner.setText(btn_text)
+        self._banner_action = action
+        self.banner.show()
+
+    def _auto_fetch(self) -> None:
+        """fetch 自动（第七章 2）：只更新记账副本，不动你的任何东西"""
+        if not (self.repo and self._repo_has_remote):
+            return
+        repo = self.repo
+
+        def job():
+            return repo.fetch()
+
+        def done(result):
+            if self.repo is repo and not isinstance(result, Exception):
+                self.refresh_status()   # 取件后 ↑↓ 更新
+
+        self.run_job(job, done)
+
+    def _pull(self) -> None:
+        """拉取 = 取件 + 合并进当前分支；永远手动，有未提交改动先警告（第七章 2）"""
+        if not self.repo:
+            return
+        st = self._last_status
+        if st and any(f.group in ("staged", "unstaged") for f in st.files):
+            btn = QMessageBox.question(
+                self, "有未提交改动",
+                "你有未提交的改动，拉取可能产生冲突。\n"
+                "建议先提交再拉取（改动页勾选 → 提交）。\n\n仍要继续拉取吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if btn != QMessageBox.Yes:
+                return
+
+        def on_done(rec):
+            if isinstance(rec, CommandRecord) and rec.ok:
+                history = self.pages.get("历史")   # pull 可能产生合并提交
+                if history:
+                    history.reload(self.repo)
+
+        self.run_git_job(lambda repo: repo.pull(), on_done)
+
+    def _push(self) -> None:
+        """推送；当前分支未关联远端时自动建立关联（push -u，E 类痛点一键化）"""
+        if not self.repo:
+            return
+        st = self._last_status
+        upstream = st.branch.upstream if st else None
+
+        def job(repo):
+            return repo.push_set_upstream() if not upstream else repo.push()
+
+        def on_done(rec):
+            if isinstance(rec, CommandRecord) and not rec.ok \
+                    and "non-fast-forward" in rec.output:
+                self._show_banner("⚠ 远端有你没有的新提交，先拉取",
+                                  "去拉取", self._pull)
+
+        self.run_git_job(job, on_done)
+
+    def _open_conflict_wizard(self) -> None:
+        """冲突解决向导（v1 #6，痛点 A）"""
+        if not self.repo:
+            return
+        dlg = ConflictDialog(self.repo, self)
+        dlg.exec()
+        # 向导可能产生了合并提交
+        history = self.pages.get("历史")
+        if history:
+            history.reload(self.repo)
+        self.refresh_status()
 
     def _set_branch_text(self, branch) -> None:
         if branch is None or (not branch.name and not branch.detached):

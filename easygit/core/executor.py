@@ -37,6 +37,7 @@ ERROR_HINTS = [
     ),
     ("non-fast-forward", "远端有你没有的新提交，先拉取再推送。"),
     ("nothing to commit", "没有勾选任何改动，先在改动页勾文件。"),
+    ("ambiguous argument 'HEAD~1'", "仓库里只有一个提交，没有更早的提交可撤销。"),
 ]
 
 
