@@ -112,7 +112,6 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(page, f["title"])
         # 尚未实现的功能占位页
         for title, note in (
-            ("历史", "提交历史树（多色分支线 + 点 commit 看 diff）"),
             ("分支", "分支列表 + 切换守卫 + 上游关联"),
             ("对比", "两个分支的差异文件清单"),
         ):
@@ -215,6 +214,9 @@ class MainWindow(QMainWindow):
             return
         self.repo = GitRepo(path, self.log)
         self._term_cwd = path             # 切仓库时重置终端会话目录
+        history = self.pages.get("历史")
+        if history:
+            history.reload(self.repo)     # 历史树随仓库切换加载
         self.setWindowTitle(f"EasyGit —— {path}")
         self.refresh_status()
 
@@ -269,6 +271,10 @@ class MainWindow(QMainWindow):
             self.refresh_status()
 
         run_async(job, done, parent=self, keep=self._workers)
+
+    def run_job(self, fn, on_done) -> None:
+        """后台跑任意函数（历史页等只读功能用）；不做状态刷新与错误翻译"""
+        run_async(fn, on_done, parent=self, keep=self._workers)
 
     # ================================================ 状态刷新（异步，界面永不冻结）
     def refresh_status(self) -> None:
@@ -375,6 +381,10 @@ class MainWindow(QMainWindow):
             # 手敲的 git 命令也可能改了仓库状态 → 顺手刷新
             if text.split()[0] == "git":
                 self.refresh_status()
+                if text.startswith("git commit"):
+                    history = self.pages.get("历史")
+                    if history:
+                        history.reload(self.repo)
 
         run_async(job, done, parent=self, keep=self._workers)
 
@@ -425,6 +435,9 @@ class MainWindow(QMainWindow):
         def on_done(rec):
             if isinstance(rec, CommandRecord) and rec.ok:
                 self.edit_msg.clear()   # 提交成功后清空消息；状态由自动刷新更新
+                history = self.pages.get("历史")
+                if history:
+                    history.reload(self.repo)   # 历史树同步最新提交
 
         self.run_git_job(lambda repo: repo.commit(msg), on_done)
 

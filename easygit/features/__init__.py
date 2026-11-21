@@ -15,8 +15,9 @@ def register(create_page, title: str, order: int = 100) -> None:
 
 
 def _import_builtin_features() -> None:
-    # v0.1 只有「改动」页是真功能；后续每个功能一行 import 即入列
-    from . import status_page  # noqa: F401  导入即注册
+    # 每个功能一行 import 即入列；删功能 = 删掉对应行
+    from . import status_page    # noqa: F401  「改动」页
+    from . import history_page   # noqa: F401  「历史」页
 
 
 _import_builtin_features()

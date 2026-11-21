@@ -70,6 +70,24 @@ class StatusInfo:
     files: list[GitFile] = field(default_factory=list)
 
 
+@dataclass
+class Commit:
+    """历史树上的一个提交"""
+    hash: str
+    short: str
+    parents: list[str] = field(default_factory=list)
+    author: str = ""
+    date_rel: str = ""       # 相对时间，如 "2 hours ago"
+    subject: str = ""        # 提交消息首行
+    refs: list[str] = field(default_factory=list)   # 如 ["HEAD -> main", "origin/main"]
+    # —— 泳道图布局字段（由 history_layout.assign_lanes 就地填充）——
+    lane: int = 0
+    lanes_above: list[int] = field(default_factory=list)
+    lanes_below: list[int] = field(default_factory=list)
+    merge_edges: list[tuple[int, int]] = field(default_factory=list)
+    fork_edges: list[tuple[int, int]] = field(default_factory=list)
+
+
 # ================= 封装层本体 =================
 
 class GitRepo:
@@ -146,6 +164,55 @@ class GitRepo:
     def commit(self, message: str) -> CommandRecord:
         """提交已勾选的改动（幕后即 git commit -m）"""
         return self.run_git(["commit", "-m", message])
+
+
+    # ---- 能力 4：提交历史（v1 #5 数据源） ----
+    def log(self, skip: int = 0, limit: int = 50) -> list[Commit]:
+        """按时间倒序返回提交；泳道布局由 history_layout 负责"""
+        fmt = "%H%x1f%h%x1f%P%x1f%an%x1f%ar%x1f%s%x1f%d"
+        rec = self.run_git([
+            "log", "--topo-order", f"--skip={skip}", "-n", str(limit),
+            f"--pretty=format:{fmt}",
+        ])
+        if not rec.ok:
+            return []
+        commits: list[Commit] = []
+        for line in rec.output.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) < 6:
+                continue
+            h, short, parents, author, date_rel, subject = parts[:6]
+            refs_raw = parts[6].strip() if len(parts) > 6 else ""
+            refs = [r.strip() for r in refs_raw.strip("()").split(",") if r.strip()]
+            commits.append(Commit(
+                hash=h, short=short,
+                parents=[p for p in parents.split() if p],
+                author=author, date_rel=date_rel,
+                subject=subject, refs=refs,
+            ))
+        return commits
+
+    def commit_files(self, commit_hash: str) -> list[tuple[str, str]]:
+        """某次提交改动的文件清单 [(状态, 路径)]（合并提交用 -m 展开比较）"""
+        rec = self.run_git(["diff-tree", "--no-commit-id", "--name-status",
+                            "-r", "-m", commit_hash])
+        if not rec.ok:
+            return []
+        files: list[tuple[str, str]] = []
+        for line in rec.output.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                files.append((parts[0].strip(), parts[-1]))
+        return files
+
+    def commit_diff(self, commit_hash: str, path: str) -> str:
+        """某次提交中某文件的 diff 文本（纯文本，彩色版归 diff 查看器里程碑）。
+        合并提交用 --first-parent：看它给主线带来了什么
+        （组合 diff 常为空，不适合阅读）"""
+        rec = self.run_git(["show", "--first-parent", "--format=", commit_hash, "--", path])
+        if not rec.ok:
+            return f"（无法读取 diff）{rec.output.splitlines()[0] if rec.output else ''}"
+        return rec.output
 
 
 def _parse_branch_line(text: str) -> BranchInfo:
