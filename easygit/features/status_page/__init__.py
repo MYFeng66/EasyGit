@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""「改动」页 v0.3：单列表 + 双状态列（2026-11-20 用户标定：行位置稳定不跳动、用词专业化）。
+"""「改动」页 v0.4：单列表 + 双状态列 + 右侧 diff/源码/预览查看器。
 勾上 = 纳入下次提交（幕后 git add）；取消 = 拿出（幕后 git restore --staged）。"""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLabel, QPushButton, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHBoxLayout, QHeaderView, QLabel, QPushButton, QSplitter,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import register
 from ...core.git_wrapper import StatusInfo
+from ...ui.diff_viewer import DiffViewer
 
 PATH_ROLE = Qt.UserRole + 1
 GROUP_ROLE = Qt.UserRole + 2
@@ -28,7 +31,12 @@ class StatusPage(QWidget):
         self._busy = False                # 后台操作进行中时，忽略新勾选
         self._status = None               # 最近一次状态（供“全部勾选/取消”用）
 
-        v = QVBoxLayout(self)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        split = QSplitter(Qt.Horizontal)
+
+        left = QWidget()
+        v = QVBoxLayout(left)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(4)
 
@@ -58,7 +66,15 @@ class StatusPage(QWidget):
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.itemClicked.connect(self._show_file_diff)
         v.addWidget(self.tree, 1)
+
+        # 右侧：diff / 源码 / 预览 公共查看器（与文件列表可拖动分割）
+        split.addWidget(left)
+        self.viewer = DiffViewer()
+        split.addWidget(self.viewer)
+        split.setSizes([460, 540])
+        root.addWidget(split)
 
     # ---- 对外接口：主窗口刷新时调用 ----
     def show_message(self, text: str) -> None:
@@ -109,6 +125,39 @@ class StatusPage(QWidget):
         self.tree.blockSignals(False)
         vbar.setValue(scroll)
 
+
+    # ================================================ 单文件查看（diff / 源码 / 预览）
+    def _show_file_diff(self, item: QTreeWidgetItem, col: int) -> None:
+        path = item.data(0, PATH_ROLE)
+        group = item.data(0, GROUP_ROLE)
+        if not path or not self.ctx.repo:
+            return
+        repo = self.ctx.repo
+
+        # 源码：直接读工作区文件（删除/读不到 → None，按钮自动禁用）
+        source = None
+        try:
+            fp = Path(repo.path) / path
+            if fp.is_file() and fp.stat().st_size < 500_000:
+                source = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            source = None
+
+        if group == "untracked":
+            # 未跟踪新文件：没有“与 HEAD 的差异”概念，直接看源码/预览
+            self.viewer.set_content(path=path, diff_text="", source_text=source)
+            return
+
+        def job():
+            return repo.file_diff_head(path)
+
+        def done(result):
+            if isinstance(result, Exception):
+                return
+            self.viewer.set_content(path=path, diff_text=result or "",
+                                    source_text=source)
+
+        self.ctx.run_job(job, done)
 
     # ================================================ 勾选交互（勾选即提交）
     def _on_item_changed(self, item: QTreeWidgetItem, col: int) -> None:

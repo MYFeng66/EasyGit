@@ -7,13 +7,14 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QFont, QPen
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPlainTextEdit,
-    QPushButton, QSplitter, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QSplitter, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from .. import register
 from ...core.git_wrapper import Commit
 from ...core.history_layout import assign_lanes
+from ...ui.diff_viewer import DiffViewer
 
 COMMIT_ROLE = Qt.UserRole + 10
 FILE_HASH_ROLE = Qt.UserRole + 11
@@ -163,11 +164,8 @@ class HistoryPage(QWidget):
         self.list_files = QListWidget()
         self.list_files.itemClicked.connect(self._show_file_diff)
         rv.addWidget(self.list_files, 1)
-        self.edit_diff = QPlainTextEdit()
-        self.edit_diff.setReadOnly(True)
-        self.edit_diff.setStyleSheet(
-            "font-family:Consolas,'Courier New',monospace;font-size:9pt;")
-        rv.addWidget(self.edit_diff, 1)
+        self.viewer_diff = DiffViewer()
+        rv.addWidget(self.viewer_diff, 1)
         split.addWidget(right)
         split.setSizes([660, 420])
         v.addWidget(split, 1)
@@ -184,7 +182,7 @@ class HistoryPage(QWidget):
         self._commits = []
         self.list.clear()
         self.list_files.clear()
-        self.edit_diff.clear()
+        self.viewer_diff.clear_view()
         self.label_meta.setText("点左侧任意提交，这里显示它的信息与改动文件")
         self.label_count.setText("正在读取提交历史…")
         self._load()
@@ -240,7 +238,7 @@ class HistoryPage(QWidget):
         self.label_meta.setText(
             f"{refs}\n{c.subject}\n{c.author} · {c.date_rel}\n完整哈希：{c.hash}")
         self.list_files.clear()
-        self.edit_diff.clear()
+        self.viewer_diff.clear_view()
 
         def job():
             return repo.commit_files(c.hash)
@@ -271,7 +269,7 @@ class HistoryPage(QWidget):
         def done(result):
             if isinstance(result, Exception):
                 return
-            self.edit_diff.setPlainText(result or "（无差异内容）")
+            self.viewer_diff.show_diff(result or "")
 
         self.ctx.run_job(job, done)
 
