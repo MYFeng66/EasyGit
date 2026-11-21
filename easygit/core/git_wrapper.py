@@ -214,6 +214,14 @@ class GitRepo:
             return f"（无法读取 diff）{rec.output.splitlines()[0] if rec.output else ''}"
         return rec.output
 
+    # ---- 能力 5：单文件 diff（v1 #1「点文件名看 diff」的数据源） ----
+    def file_diff_head(self, path: str) -> str:
+        """工作区+已勾选内容 vs HEAD 的单文件差异；空仓库时返回空串"""
+        rec = self.run_git(["diff", "HEAD", "--", path])
+        if not rec.ok:
+            return ""    # 空仓库（还没有任何提交）时 HEAD 不存在
+        return rec.output
+
 
 def _parse_branch_line(text: str) -> BranchInfo:
     """解析 '## main...origin/main [ahead 2, behind 1]' 这类行"""
