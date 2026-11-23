@@ -318,10 +318,22 @@ class HistoryPage(QWidget):
         menu.exec(self.list.viewport().mapToGlobal(pos))
 
     def _checkout_version(self, c) -> None:
-        """detached 查看旧版本：记住原分支，横幅提供一键回家"""
+        """detached 查看旧版本：记住原分支，横幅提供一键回家。
+        2026-11-21 实战加固：脏树时先警告（改动会跟着你走；在旧版本里提交后回家会丢）"""
         st = getattr(self.ctx, "_last_status", None)
-        if st and st.branch and not st.branch.detached and st.branch.name:
-            self.ctx._detach_return_branch = st.branch.name
+        dirty = st and any(f.group in ("staged", "unstaged") for f in st.files)
+        if dirty:
+            btn = QMessageBox.question(
+                self, "有未提交改动",
+                "工作区有未提交改动。看旧版本时这些改动会跟着你走；\n"
+                "若在旧版本里把它们提交，回家时提交会被搁下丢失。\n\n"
+                "建议先提交或储藏，再去看旧版本。\n仍要看旧版本吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if btn != QMessageBox.Yes:
+                return
+        st2 = getattr(self.ctx, "_last_status", None)
+        if st2 and st2.branch and not st2.branch.detached and st2.branch.name:
+            self.ctx._detach_return_branch = st2.branch.name
 
         def job(repo):
             return repo.checkout_detached(c.hash)

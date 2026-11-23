@@ -533,6 +533,34 @@ class MainWindow(QMainWindow):
         msg = self.edit_msg.text().strip()
         if not msg or not self.repo:
             return
+        # detached 拦截（2026-11-21 实战事故：detached 提交落在无主之地，回家即丢）
+        st = self._last_status
+        if st and st.branch.detached:
+            ret = self._detach_return_branch
+            box = QMessageBox(self)
+            box.setWindowTitle("你正在看旧版本")
+            box.setIcon(QMessageBox.Warning)
+            box.setText(
+                "现在 HEAD 游离，这里提交不属于任何分支，\n"
+                "回家时提交会被搁在原地、从历史里消失。\n\n"
+                "建议先回到分支再提交（勾选与提交消息都会保留）。")
+            b_home = box.addButton(
+                f"回到 {ret} 再提交" if ret else "去分支页回分支再提交",
+                QMessageBox.AcceptRole)
+            b_stay = box.addButton("仍在这里提交（我清楚后果）",
+                                   QMessageBox.DestructiveRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is b_home:
+                if ret:
+                    self._switch_back(ret)
+                else:
+                    self.tabs.setCurrentIndex(2)
+                return
+            if clicked is not b_stay:
+                return
+            # b_stay → 放行，走正常提交流程
         self.btn_commit.setEnabled(False)
 
         def on_done(rec):
